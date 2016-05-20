@@ -1,0 +1,18 @@
+[package]
+name = "cfg-regex"
+version = "0.0.0"
+
+authors = ["Piotr Czarnecki <pioczarn@gmail.com>"]
+description = "Conversion from a regular expression to a context-free grammar."
+keywords = ["regular", "regex", "dfa", "nfa", "automata"]
+documentation = "http://pczarn.github.io/gearley/"
+repository = "https://github.com/pczarn/gearley"
+license = "MIT/Apache-2.0"
+
+[lib]
+name = "cfg_regex"
+
+[dependencies]
+cfg = "0.3"
+regex_dfa = "0.4"
+regex-syntax = "0.3"
