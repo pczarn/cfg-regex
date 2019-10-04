@@ -1,5 +1,4 @@
 extern crate cfg;
-extern crate regex_dfa;
 extern crate regex_syntax;
 
 pub use regex_syntax::hir::{
