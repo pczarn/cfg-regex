@@ -2,7 +2,6 @@ extern crate cfg;
 extern crate regex_dfa;
 extern crate regex_syntax;
 
-// pub use regex_syntax::ast::ClassSetRange;
 pub use regex_syntax::hir::{
     Hir,
     HirKind,
@@ -16,19 +15,65 @@ pub use regex_syntax::hir::{
     RepetitionRange,
 };
 
-use std::collections::BTreeMap;
 use std::iter;
 
 use cfg::{Cfg, Symbol, ContextFree};
 use cfg::history::RewriteSequence;
 use regex_syntax::{Result, Parser};
-// use regex_syntax::{Expr, ExprBuilder, Result, CharClass, Repeater};
 
+struct ClassMap {
+    map: Vec<(Class, Symbol)>,
+}
+
+impl ClassMap {
+    fn get(&self, key: &Class) -> Option<Symbol> {
+        for &(ref class, sym) in &self.map {
+            if class == key {
+                return Some(sym);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, key: Class, value: Symbol) -> Option<Symbol> {
+        for &mut (ref class, ref mut sym) in &mut self.map {
+            if class == &key {
+                let old_value = *sym;
+                *sym = value;
+                return Some(old_value);
+            }
+        }
+        self.map.push((key, value));
+        None
+    }
+
+    fn contains_class(&self, key: &Class) -> bool {
+        for &(ref class, _) in &self.map {
+            if class == key {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_or_insert_with<F>(&mut self, key: Class, f: F) -> Symbol
+        where F: FnOnce() -> Symbol,
+    {
+        for &(ref class, sym) in &self.map {
+            if class == &key {
+                return sym;
+            }
+        }
+        let sym = f();
+        self.map.push((key, sym));
+        sym
+    }
+}
 
 pub struct RegexTranslation<'a, H> {
     // Every distinct class has a terminal or nonterminal symbol.
     // Empty class [] points to a nulling symbol, if used.
-    classes: BTreeMap<Class, Symbol>,
+    classes: ClassMap,
     // A grammar.
     cfg: &'a mut Cfg<H>,
 }
@@ -38,7 +83,9 @@ impl<'a, H> RegexTranslation<'a, H>
 {
     pub fn new(cfg: &'a mut Cfg<H>) -> RegexTranslation<'a, H> {
         RegexTranslation {
-            classes: BTreeMap::new(),
+            classes: ClassMap {
+                map: vec![]
+            },
             cfg,
         }
     }
@@ -127,7 +174,7 @@ impl<'a, H> RegexTranslation<'a, H>
         let range = ClassUnicodeRange::new(ch, ch);
         let class = ClassUnicode::new(iter::once(range));
         let cfg = &mut self.cfg;
-        *self.classes.entry(Class::Unicode(class)).or_insert_with(|| {
+        self.classes.get_or_insert_with(Class::Unicode(class), || {
             cfg.sym()
         })
     }
@@ -136,7 +183,7 @@ impl<'a, H> RegexTranslation<'a, H>
         let range = ClassBytesRange::new(byte, byte);
         let class = ClassBytes::new(iter::once(range));
         let cfg = &mut self.cfg;
-        *self.classes.entry(Class::Bytes(class)).or_insert_with(|| {
+        self.classes.get_or_insert_with(Class::Bytes(class), || {
             cfg.sym()
         })
     }
@@ -144,14 +191,14 @@ impl<'a, H> RegexTranslation<'a, H>
     fn rewrite_class(&mut self, class: &Class) -> Symbol {
         match class {
             &Class::Unicode(ref unicode) => {
-                if self.classes.contains_key(class) {
-                    *self.classes.get(class).unwrap()
+                if self.classes.contains_class(class) {
+                    self.classes.get(class).unwrap()
                 } else {
                     let class_sym = self.cfg.sym();
                     for range in unicode.iter() {
                         let key = Class::Unicode(ClassUnicode::new(iter::once(range.clone())));
                         let cfg = &mut self.cfg;
-                        let range_sym = *self.classes.entry(key).or_insert_with(|| {
+                        let range_sym = self.classes.get_or_insert_with(key, || {
                             cfg.sym()
                         });
                         // if unicode.ranges().len() > 1 {
@@ -164,14 +211,14 @@ impl<'a, H> RegexTranslation<'a, H>
                 }
             }
             &Class::Bytes(ref bytes) => {
-                if self.classes.contains_key(class) {
-                    *self.classes.get(class).unwrap()
+                if self.classes.contains_class(class) {
+                    self.classes.get(class).unwrap()
                 } else {
                     let class_sym = self.cfg.sym();
                     for range in bytes.iter() {
                         let key = Class::Bytes(ClassBytes::new(iter::once(range.clone())));
                         let cfg = &mut self.cfg;
-                        let range_sym = *self.classes.entry(key).or_insert_with(|| {
+                        let range_sym = self.classes.get_or_insert_with(key, || {
                             cfg.sym()
                         });
                         // if unicode.ranges().len() > 1 {
@@ -190,7 +237,7 @@ impl<'a, H> RegexTranslation<'a, H>
         let empty_class_unicode = Class::Unicode(ClassUnicode::empty());
         let empty_class_bytes = Class::Bytes(ClassBytes::empty());
         let cfg = &mut self.cfg;
-        let value = *self.classes.entry(empty_class_unicode).or_insert_with(|| {
+        let value = self.classes.get_or_insert_with(empty_class_unicode, || {
             let empty = cfg.sym();
             cfg.rule(empty).rhs_with_history([], H::default());
             empty
@@ -199,7 +246,7 @@ impl<'a, H> RegexTranslation<'a, H>
         value
     }
 
-    pub fn classes(&self) -> &BTreeMap<Class, Symbol> {
-        &self.classes
+    pub fn class_map(&self) -> &Vec<(Class, Symbol)> {
+        &self.classes.map
     }
 }
