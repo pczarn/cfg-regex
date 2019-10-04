@@ -15,4 +15,4 @@ name = "cfg_regex"
 [dependencies]
 cfg = "0.3"
 regex_dfa = "0.5"
-regex-syntax = { git = "https://github.com/pczarn/regex" }
+regex-syntax = { git = "https://github.com/pczarn/regex", version = "0.6" }
