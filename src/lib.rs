@@ -2,142 +2,204 @@ extern crate cfg;
 extern crate regex_dfa;
 extern crate regex_syntax;
 
-pub use regex_syntax::ClassRange;
+// pub use regex_syntax::ast::ClassSetRange;
+pub use regex_syntax::hir::{
+    Hir,
+    HirKind,
+    Literal,
+    Class,
+    ClassUnicode,
+    ClassBytes,
+    ClassUnicodeRange,
+    ClassBytesRange,
+    RepetitionKind,
+    RepetitionRange,
+};
 
 use std::collections::BTreeMap;
+use std::iter;
 
 use cfg::{Cfg, Symbol, ContextFree};
 use cfg::history::RewriteSequence;
-use regex_syntax::{Expr, ExprBuilder, Result, CharClass, Repeater};
+use regex_syntax::{Result, Parser};
+// use regex_syntax::{Expr, ExprBuilder, Result, CharClass, Repeater};
 
-pub struct RegexTranslation {
-    // Here, Vec<ClassRange> is the content of CharClass.
-    classes: BTreeMap<Vec<ClassRange>, Symbol>,
-    // Every distinct range has a terminal symbol.
-    ranges: BTreeMap<ClassRange, Symbol>,
-    // A nulling symbol, if used.
-    empty: Option<Symbol>,
+
+pub struct RegexTranslation<'a, H> {
+    // Every distinct class has a terminal or nonterminal symbol.
+    // Empty class [] points to a nulling symbol, if used.
+    classes: BTreeMap<Class, Symbol>,
+    // A grammar.
+    cfg: &'a mut Cfg<H>,
 }
 
-impl RegexTranslation {
-    pub fn new() -> Self {
+impl<'a, H> RegexTranslation<'a, H>
+    where H: Clone + Default + RewriteSequence<Rewritten = H>
+{
+    pub fn new(cfg: &'a mut Cfg<H>) -> RegexTranslation<'a, H> {
         RegexTranslation {
             classes: BTreeMap::new(),
-            ranges: BTreeMap::new(),
-            empty: None,
+            cfg,
         }
     }
 
-    pub fn rewrite_string<H>(&mut self, cfg: &mut Cfg<H>, string: &str) -> Symbol
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
+    pub fn change_cfg<'b, H2>(self, other_cfg: &'b mut Cfg<H2>) -> RegexTranslation<'b, H2>
+        where H2: Clone + Default + RewriteSequence<Rewritten = H>
     {
-        let factors = string.chars().map(|ch| self.rewrite_char(cfg, ch)).collect::<Vec<_>>();
-        let lhs = cfg.sym();
-        cfg.rule(lhs).rhs_with_history(&factors[..], H::default());
+        RegexTranslation {
+            classes: self.classes,
+            cfg: other_cfg,
+        }
+    }
+    
+    pub fn rewrite_string(&mut self, string: &str) -> Symbol {
+        let factors = string.chars().map(|ch| self.rewrite_char(ch)).collect::<Vec<_>>();
+        let lhs = self.cfg.sym();
+        self.cfg.rule(lhs).rhs_with_history(&factors[..], H::default());
         lhs
     }
 
-    pub fn rewrite_regex<H>(&mut self, cfg: &mut Cfg<H>, regex: &str) -> Result<Symbol>
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
-    {
-        ExprBuilder::new().unicode(true).allow_bytes(false).parse(regex).map(|expr| {
-            self.rewrite_expr(cfg, &expr)
-        })
+    pub fn rewrite_regex(&mut self, regex: &str) -> Result<Symbol> {
+        Parser::new().parse(regex).map(|hir| self.rewrite_hir(&hir))
     }
 
-    fn rewrite_expr<H>(&mut self, cfg: &mut Cfg<H>, expr: &Expr) -> Symbol
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
-    {
-        match *expr {
-            Expr::Empty => {
-                self.empty(cfg)
+    fn rewrite_hir(&mut self, hir: &Hir) -> Symbol {
+        match hir.kind() {
+            &HirKind::Empty => {
+                self.empty()
             }
-            Expr::Literal { ref chars, casei } => {
-                assert!(!casei);
-                let factors = chars.iter().map(|&ch| {
-                    self.rewrite_char(cfg, ch)
-                }).collect::<Vec<_>>();
-                let lhs = cfg.sym();
-                cfg.rule(lhs).rhs_with_history(&factors[..], H::default());
-                lhs
+            &HirKind::Literal(Literal::Unicode(ch)) => {
+                self.rewrite_char(ch)
             }
-            Expr::Class(ref class) => {
-                self.rewrite_class(cfg, class)
+            &HirKind::Literal(Literal::Byte(byte)) => {
+                self.rewrite_byte(byte)
             }
-            Expr::Concat(ref factors) => {
+            &HirKind::Class(ref class) => {
+                self.rewrite_class(class)
+            }
+            &HirKind::Concat(ref factors) => {
                 let mut rhs = vec![];
                 for factor in factors {
-                    let factor_sym = self.rewrite_expr(cfg, factor);
+                    let factor_sym = self.rewrite_hir(factor);
                     rhs.push(factor_sym);
                 }
-                let lhs = cfg.sym();
-                cfg.rule(lhs).rhs_with_history(&rhs[..], H::default());
+                let lhs = self.cfg.sym();
+                self.cfg.rule(lhs).rhs_with_history(&rhs[..], H::default());
                 lhs
             }
-            Expr::Alternate(ref sum) => {
-                let lhs = cfg.sym();
-                for summand in sum {
-                    let summand_sym = self.rewrite_expr(cfg, summand);
-                    cfg.rule(lhs).rhs_with_history([summand_sym], H::default());
+            // Beware! This code was written after some strong alcohocil drinks.
+            &HirKind::Repetition(ref repetition) => {
+                assert!(repetition.greedy);
+                let (min, max) = match repetition.kind {
+                    RepetitionKind::Range(RepetitionRange::Exactly(x)) => (x, Some(x)),
+                    RepetitionKind::Range(RepetitionRange::AtLeast(x)) => (x, None),
+                    RepetitionKind::Range(RepetitionRange::Bounded(x, y)) => (x, Some(y)),
+                    RepetitionKind::ZeroOrOne => (0, Some(1)),
+                    RepetitionKind::ZeroOrMore => (0, None),
+                    RepetitionKind::OneOrMore => (1, None),
+                };
+                let lhs = self.cfg.sym();
+                let inner_sym = self.rewrite_hir(&*repetition.hir);
+                self.cfg.sequence(lhs).inclusive(min, max).rhs_with_history(inner_sym, H::default());
+                lhs
+            }
+            &HirKind::Group(ref group) => {
+                let lhs = self.cfg.sym();
+                let inner_sym = self.rewrite_hir(&*group.hir);
+                self.cfg.rule(lhs).rhs_with_history([inner_sym], H::default());
+                lhs
+            }
+            &HirKind::Alternation(ref summands) => {
+                let lhs = self.cfg.sym();
+                for summand in summands {
+                    let summand_sym = self.rewrite_hir(summand);
+                    self.cfg.rule(lhs).rhs_with_history([summand_sym], H::default());
                 }
                 lhs
             }
-            Expr::Repeat { e: ref inner_expr, r: repetition, greedy } => {
-                assert!(greedy);
-                let (min, max) = match repetition {
-                    Repeater::Range { min, max } => (min, max),
-                    Repeater::ZeroOrOne => (0, Some(1)),
-                    Repeater::ZeroOrMore => (0, None),
-                    Repeater::OneOrMore => (1, None),
-                };
-                let lhs = cfg.sym();
-                let inner_sym = self.rewrite_expr(cfg, &**inner_expr);
-                cfg.sequence(lhs).inclusive(min, max).rhs_with_history(inner_sym, H::default());
-                lhs
+            &HirKind::Anchor(..) | &HirKind::WordBoundary(..) => {
+                panic!();
             }
-            _ => panic!()
         }
     }
 
-    fn rewrite_char<H>(&mut self, cfg: &mut Cfg<H>, ch: char) -> Symbol
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
-    {
-        let range = ClassRange { start: ch, end: ch };
-        *self.ranges.entry(range).or_insert_with(|| {
+    fn rewrite_char(&mut self, ch: char) -> Symbol {
+        let range = ClassUnicodeRange::new(ch, ch);
+        let class = ClassUnicode::new(iter::once(range));
+        let cfg = &mut self.cfg;
+        *self.classes.entry(Class::Unicode(class)).or_insert_with(|| {
             cfg.sym()
         })
     }
 
-    fn rewrite_class<H>(&mut self, cfg: &mut Cfg<H>, class: &CharClass) -> Symbol
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
-    {
-        let ranges = &mut self.ranges;
-        *self.classes.entry((**class).clone()).or_insert_with(|| {
-            let class_sym = cfg.sym();
-            for &range in class {
-                let range_sym = *ranges.entry(range).or_insert_with(|| {
-                    cfg.sym()
-                });
-                cfg.rule(class_sym).rhs_with_history([range_sym], H::default());
-            }
-            class_sym
+    fn rewrite_byte(&mut self, byte: u8) -> Symbol {
+        let range = ClassBytesRange::new(byte, byte);
+        let class = ClassBytes::new(iter::once(range));
+        let cfg = &mut self.cfg;
+        *self.classes.entry(Class::Bytes(class)).or_insert_with(|| {
+            cfg.sym()
         })
     }
 
-    fn empty<H>(&mut self, cfg: &mut Cfg<H>) -> Symbol
-        where H: Clone + Default + RewriteSequence<Rewritten = H>
-    {
-        if let Some(empty) = self.empty {
-            empty
-        } else {
-            let empty = cfg.sym();
-            cfg.rule(empty).rhs_with_history([], H::default());
-            self.empty = Some(empty);
-            empty
+    fn rewrite_class(&mut self, class: &Class) -> Symbol {
+        match class {
+            &Class::Unicode(ref unicode) => {
+                if self.classes.contains_key(class) {
+                    *self.classes.get(class).unwrap()
+                } else {
+                    let class_sym = self.cfg.sym();
+                    for range in unicode.iter() {
+                        let key = Class::Unicode(ClassUnicode::new(iter::once(range.clone())));
+                        let cfg = &mut self.cfg;
+                        let range_sym = *self.classes.entry(key).or_insert_with(|| {
+                            cfg.sym()
+                        });
+                        // if unicode.ranges().len() > 1 {
+                        // else simplify
+                        // }
+                        self.cfg.rule(class_sym).rhs_with_history([range_sym], H::default());
+                    }
+                    self.classes.insert(class.clone(), class_sym);
+                    class_sym
+                }
+            }
+            &Class::Bytes(ref bytes) => {
+                if self.classes.contains_key(class) {
+                    *self.classes.get(class).unwrap()
+                } else {
+                    let class_sym = self.cfg.sym();
+                    for range in bytes.iter() {
+                        let key = Class::Bytes(ClassBytes::new(iter::once(range.clone())));
+                        let cfg = &mut self.cfg;
+                        let range_sym = *self.classes.entry(key).or_insert_with(|| {
+                            cfg.sym()
+                        });
+                        // if unicode.ranges().len() > 1 {
+                        // else simplify
+                        // }
+                        self.cfg.rule(class_sym).rhs_with_history([range_sym], H::default());
+                    }
+                    self.classes.insert(class.clone(), class_sym);
+                    class_sym
+                }
+            }
         }
     }
 
-    pub fn get_ranges(&self) -> &BTreeMap<ClassRange, Symbol> {
-        &self.ranges
+    fn empty(&mut self) -> Symbol {
+        let empty_class_unicode = Class::Unicode(ClassUnicode::empty());
+        let empty_class_bytes = Class::Bytes(ClassBytes::empty());
+        let cfg = &mut self.cfg;
+        let value = *self.classes.entry(empty_class_unicode).or_insert_with(|| {
+            let empty = cfg.sym();
+            cfg.rule(empty).rhs_with_history([], H::default());
+            empty
+        });
+        self.classes.insert(empty_class_bytes, value);
+        value
+    }
+
+    pub fn classes(&self) -> &BTreeMap<Class, Symbol> {
+        &self.classes
     }
 }
